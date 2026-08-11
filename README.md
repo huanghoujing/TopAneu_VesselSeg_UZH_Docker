@@ -16,11 +16,19 @@ fold 4, `checkpoint_final.pth`), plus an optional napari-based screenshot render
 From this directory (the build context must contain `nnUNet/`, `run_inference.py`, `Dockerfile`):
 
 ```bash
-docker build -t topaneu_vesselseg_uzh .
+docker build \
+    --build-arg USER_UID=$(id -u) \
+    --build-arg USER_GID=$(id -g) \
+    -t topaneu_vesselseg_uzh .
 ```
 
 The model weights in `nnUNet/data/results/Dataset572_TopAneu_Vessel_36fgCls_wLRSwap/`
 (~790 MB, only `checkpoint_final.pth` + plans/dataset JSONs + logs) are baked into the image.
+
+The `USER_UID`/`USER_GID` build args make the container user match your host
+user (see [File permissions & sudo](#file-permissions--sudo)); if omitted they
+default to `1000:1000`. Changing them only rebuilds the final (tiny) image
+layer, not the dependency layers.
 
 ## Run (interactive mode)
 
@@ -33,12 +41,38 @@ docker run --rm -it \
     topaneu_vesselseg_uzh
 ```
 
-This drops you into a bash shell at `/app/nnUNet` with the Python virtualenv
-already on `PATH`.
+This drops you into a bash shell at `/app/nnUNet` (as user `topaneu`) with the
+Python virtualenv already on `PATH`.
 
 - `--gpus all` — expose GPUs (or e.g. `--gpus '"device=0"'` for a specific one)
 - `--ipc=host` — recommended; the inference pipeline uses multiprocessing with shared memory
 - `-v ...:/input`, `-v ...:/output` — mount your data; any paths work, `/input` / `/output` are just conventions
+
+## File permissions & sudo
+
+The container runs as non-root user `topaneu` with **passwordless sudo**
+(`sudo apt-get install ...` etc. works inside the container).
+
+Mounted host files keep their host owner (UID/GID) inside the container. So:
+
+- **Build with `--build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -g)`**
+  (as shown above). The container user then has the *same UID/GID as you*:
+  it can read your mounted input files, and everything it writes to `/output`
+  is owned by you on the host — no `root`-owned result files to clean up.
+- If you got an image built for a *different* UID (e.g. from someone else),
+  override the user at runtime instead of rebuilding:
+
+  ```bash
+  docker run --rm -it --gpus all --ipc=host \
+      --user $(id -u):$(id -g) -e HOME=/tmp \
+      -v /path/to/images:/input -v /path/to/results:/output \
+      topaneu_vesselseg_uzh
+  ```
+
+  (`-e HOME=/tmp` gives config files a writable home; `sudo` is not available
+  in this mode since the anonymous UID is not in the sudoers file.)
+- If your input data is only readable by another group, add the group with
+  `--group-add <gid>`.
 
 ## Inference
 

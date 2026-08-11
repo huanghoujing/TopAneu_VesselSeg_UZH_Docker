@@ -4,6 +4,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 # xvfb + Qt/OpenGL runtime libs for headless napari screenshot rendering
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        sudo \
         xvfb \
         libgl1 \
         libegl1 \
@@ -48,5 +49,18 @@ ENV PATH="/app/nnUNet/.venv/bin:${PATH}" \
     MKL_NUM_THREADS=4 \
     OPENBLAS_NUM_THREADS=4 \
     nnUNet_n_proc_DA=1
+
+# Non-root user with passwordless sudo. Build with
+#   --build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -g)
+# so files in mounted volumes are read/writable by both container and host user.
+ARG USERNAME=topaneu
+ARG USER_UID=1000
+ARG USER_GID=1000
+RUN groupadd --gid ${USER_GID} ${USERNAME} \
+    && useradd --uid ${USER_UID} --gid ${USER_GID} --create-home --shell /bin/bash ${USERNAME} \
+    && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} \
+    && chmod 0440 /etc/sudoers.d/${USERNAME}
+USER ${USERNAME}
+ENV HOME=/home/${USERNAME}
 
 CMD ["/bin/bash"]
