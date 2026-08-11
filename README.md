@@ -70,16 +70,16 @@ docker run --rm --gpus all --ipc=host \
 | `-i, --input` | (required) | NIfTI file, or folder searched recursively |
 | `-o, --output` | (required) | Output dir; mirrors input sub-folder structure |
 | `--suffix` | `.nii.gz` | Input filename suffix to match; stripped from the case name. Use `_0000.nii.gz` for nnU-Net channel-suffixed images (output then drops `_0000`), or `.nii` for uncompressed NIfTI |
-| `--output-ext` | `.nii.gz` | Extension of saved segmentations |
+| `--output_ext` | `.nii.gz` | Extension of saved segmentations |
 | `--sequential` | off | Run the pipeline sequentially in one process instead of parallel workers |
-| `--n-infer-workers` | `1` | GPU inference workers |
-| `--n-pre-post-workers` | `2` | Preprocessing workers and post-processing workers (also the queue sizes) |
-| `--n-gpus` | `1` | GPUs to spread inference workers over |
-| `--overwrite-existing` | off | Re-run cases whose output already exists (default: skip them) |
+| `--n_infer_workers` | `1` | GPU inference workers |
+| `--n_pre_post_workers` | `2` | Preprocessing workers and post-processing workers (also the queue sizes) |
+| `--n_gpus` | `1` | GPUs to spread inference workers over |
+| `--overwrite_existing` | off | Re-run cases whose output already exists (default: skip them) |
 | `--vis` | off | Render napari screenshot galleries of the predictions after inference |
-| `--vis-out-dir` | `<output>_VIZ` | Where to save screenshot PNGs (mirrors sub-folder structure) |
-| `--vis-views` | `anterior left superior x y z` | Views per gallery |
-| `--vis-grid-cols` | `3` | Gallery grid columns |
+| `--vis_out_dir` | `<output>_VIZ` | Where to save screenshot PNGs (mirrors sub-folder structure) |
+| `--vis_views` | `anterior left superior x y z` | Views per gallery |
+| `--vis_grid_cols` | `3` | Gallery grid columns |
 
 ### CPU thread limits
 
@@ -122,9 +122,15 @@ xvfb-run -a python nnunetv2/houjing_scripts/vis_label_screenshots_napari_multi_v
 - **Invalid NIfTI files**: unreadable inputs are logged and skipped; the rest of
   the batch continues. To pre-check a folder:
   `python nnunetv2/houjing_scripts/20260602_topaneu_vessel/D571_D572/inference_demo/check_invalid_nifti.py --input-dir /input --output-file /output/invalid_nifti.txt --read-pixels`
-- **Duplicate basenames** in different sub-folders are handled automatically
-  (processed in sequential batches to avoid temp-file collisions).
 - **Custom weights**: set `-e TOPANEU_MODEL_ROOT=/path/to/weights` to point the
   runner at a mounted weights directory with the same three model sub-folders.
-- Temporary preprocessed `.npz` files are written to `<output>/tmp_preprocessed/`
-  during a run and cleaned up as cases complete.
+- **Temporary files**: preprocessed cases are staged as compressed `.npz` files
+  in `<output>/tmp_preprocessed/`. Disk usage there is bounded, not proportional
+  to dataset size: the hand-off queue is bounded (`--n_pre_post_workers` slots),
+  preprocessing blocks when it is full, and the GPU worker deletes each `.npz`
+  immediately after loading it — so at most about
+  `2 * n_pre_post_workers + n_infer_workers` cases (~5 with defaults) exist at
+  any moment. Leftovers are removed and the folder deleted at the end of the run;
+  after a crash/kill, stale files there are safe to delete manually. Temp
+  filenames include a hash of the relative input path, so files with the same
+  basename in different sub-folders cannot collide.

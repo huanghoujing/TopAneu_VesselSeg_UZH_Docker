@@ -26,6 +26,7 @@ The .npz mechamism instead of passing preprocessed data directly via queue solve
     FileNotFoundError: [Errno 2] No such file or directory
 """
 from shlex import join
+import hashlib
 import torch
 import os
 import sys
@@ -156,8 +157,11 @@ def preprocess_worker(queue1, fnames, in_dir, out_dir, suffix, output_ext, plans
                 data_props = dct.get('data_properties', {})
                 preprocessed_storage.append((data, data_props))
 
-            # Save to compressed npz
-            tmp_path = os.path.join(tmp_folder, f"{casename}_pp.npz")
+            # Save to compressed npz.
+            # Hash the full (possibly nested) fname so files with the same
+            # basename in different subfolders don't collide in tmp_folder.
+            fname_hash = hashlib.md5(fname.encode()).hexdigest()[:8]
+            tmp_path = os.path.join(tmp_folder, f"{casename}_{fname_hash}_pp.npz")
             save_dict = {}
             for idx, (data, props) in enumerate(preprocessed_storage):
                 save_dict[f"p{idx}_data"] = data

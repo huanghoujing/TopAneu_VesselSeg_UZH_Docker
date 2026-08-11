@@ -71,28 +71,28 @@ def parse_args():
     p.add_argument('--suffix', default='.nii.gz',
                    help="Input filename suffix to match; it is stripped from the case name "
                         "(e.g. '_0000.nii.gz' strips the channel suffix from output names).")
-    p.add_argument('--output-ext', default='.nii.gz',
+    p.add_argument('--output_ext', default='.nii.gz',
                    help='Extension of the saved segmentations.')
     p.add_argument('--sequential', action='store_true',
                    help='Run preprocess/inference/postprocess sequentially in one process '
                         'instead of the parallel pipeline.')
-    p.add_argument('--n-infer-workers', type=int, default=1,
+    p.add_argument('--n_infer_workers', type=int, default=1,
                    help='Number of GPU inference workers.')
-    p.add_argument('--n-pre-post-workers', type=int, default=2,
+    p.add_argument('--n_pre_post_workers', type=int, default=2,
                    help='Number of preprocessing workers and of post-processing workers.')
-    p.add_argument('--n-gpus', type=int, default=1,
+    p.add_argument('--n_gpus', type=int, default=1,
                    help='Number of GPUs to spread inference workers over.')
-    p.add_argument('--overwrite-existing', action='store_true',
+    p.add_argument('--overwrite_existing', action='store_true',
                    help='Re-run cases whose output file already exists (default: skip them).')
     p.add_argument('--vis', action='store_true',
                    help='After inference, render multi-view napari screenshot galleries '
                         'of the predictions (requires xvfb, included in the image).')
-    p.add_argument('--vis-out-dir', type=Path, default=None,
+    p.add_argument('--vis_out_dir', type=Path, default=None,
                    help='Output directory for screenshots (default: <output>_VIZ).')
-    p.add_argument('--vis-views', nargs='+',
+    p.add_argument('--vis_views', nargs='+',
                    default=['anterior', 'left', 'superior', 'x', 'y', 'z'],
                    help='Views to render in the screenshot gallery.')
-    p.add_argument('--vis-grid-cols', type=int, default=3,
+    p.add_argument('--vis_grid_cols', type=int, default=3,
                    help='Number of columns in the screenshot gallery.')
     return p.parse_args()
 
@@ -115,23 +115,6 @@ def find_cases(input_path: Path, suffix: str):
         )
         return input_path, fnames
     sys.exit(f"Input path does not exist: {input_path}")
-
-
-def batch_by_unique_basename(fnames):
-    """The pipeline stores temporary files under the case basename, so two nested
-    files with the same basename must not be in flight at the same time. Partition
-    fnames into batches with unique basenames (almost always a single batch)."""
-    batches = []
-    for fname in fnames:
-        base = os.path.basename(fname)
-        for names, batch in batches:
-            if base not in names:
-                names.add(base)
-                batch.append(fname)
-                break
-        else:
-            batches.append(({base}, [fname]))
-    return [batch for _, batch in batches]
 
 
 def run_vis(args, in_dir: Path, fnames):
@@ -172,32 +155,24 @@ def main():
 
     from nnunetv2.houjing_scripts.infer_ppl_parallel_npz import infer_folder
 
-    batches = batch_by_unique_basename(fnames)
-    if len(batches) > 1:
-        print(f"NOTE: duplicate basenames in nested folders -> running {len(batches)} "
-              f"batches sequentially to avoid temp-file collisions.")
-
-    for i, batch in enumerate(batches):
-        if len(batches) > 1:
-            print(f"\n=== Batch {i + 1}/{len(batches)} ({len(batch)} cases) ===")
-        infer_folder(
-            in_dir=str(in_dir),
-            out_dir=str(args.output),
-            fnames=batch,
-            suffix=args.suffix,
-            output_ext=args.output_ext,
-            model_cfg=build_model_cfg(),
-            sequential=args.sequential,
-            n_preprocess_workers=args.n_pre_post_workers,
-            n_infer_workers=args.n_infer_workers,
-            n_post_inference_workers=args.n_pre_post_workers,
-            queue1_size=args.n_pre_post_workers,
-            queue2_size=args.n_pre_post_workers,
-            n_gpus=args.n_gpus,
-            use_mirroring=True,
-            post_process=True,
-            skip_existing=not args.overwrite_existing,
-        )
+    infer_folder(
+        in_dir=str(in_dir),
+        out_dir=str(args.output),
+        fnames=fnames,
+        suffix=args.suffix,
+        output_ext=args.output_ext,
+        model_cfg=build_model_cfg(),
+        sequential=args.sequential,
+        n_preprocess_workers=args.n_pre_post_workers,
+        n_infer_workers=args.n_infer_workers,
+        n_post_inference_workers=args.n_pre_post_workers,
+        queue1_size=args.n_pre_post_workers,
+        queue2_size=args.n_pre_post_workers,
+        n_gpus=args.n_gpus,
+        use_mirroring=True,
+        post_process=True,
+        skip_existing=not args.overwrite_existing,
+    )
 
     print(f"\nSegmentations saved to: {args.output}")
 
