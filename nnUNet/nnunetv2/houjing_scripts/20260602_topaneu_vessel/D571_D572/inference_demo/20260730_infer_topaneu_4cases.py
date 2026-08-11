@@ -16,13 +16,13 @@ from nnunetv2.houjing_scripts.infer_ppl_parallel_npz import infer_folder
 from glob import glob
 import os
 
-def infer_one_model(model_cfg, in_dir, out_dir, alias=None, n_infer_workers=1, n_pre_post_workers=2, overwrite_trainer_name=None):
+def infer_one_model(model_cfg, in_dir, out_dir, suffix='.nii.gz', output_ext='.nii.gz', alias=None, sequential=False, n_infer_workers=1, n_pre_post_workers=2, n_gpus=1, overwrite_trainer_name=None):
     if alias is None:
         alias = os.path.basename(out_dir)
     print(f"\n\n=== Inferring {alias} ===\n\n")
-    files = sorted(glob(f"{in_dir}/*.nii.gz"))
+    files = sorted(glob(f"{in_dir}/*{suffix}"))
     print(f"Found {len(files)} files")
-    suffix = '.nii.gz'
+    
     fnames = []
     fnames += [os.path.basename(x).replace(suffix, '') for x in files]
     print(f"\n {len(fnames) = } \n")
@@ -36,13 +36,15 @@ def infer_one_model(model_cfg, in_dir, out_dir, alias=None, n_infer_workers=1, n
         out_dir=out_dir,
         fnames=fnames,
         suffix=suffix,
+        output_ext=output_ext,
         model_cfg=model_cfg,
-        sequential=True,
+        sequential=sequential,
         n_preprocess_workers=n_pre_post_workers,
         n_infer_workers=n_infer_workers,
         n_post_inference_workers=n_pre_post_workers,
         queue1_size=n_pre_post_workers,
         queue2_size=n_pre_post_workers,
+        n_gpus=n_gpus,
         use_mirroring=True,
         post_process=True,
         skip_existing=True
