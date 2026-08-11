@@ -6,6 +6,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 RUN apt-get update && apt-get install -y --no-install-recommends \
         sudo \
         xvfb \
+        xauth \
         libgl1 \
         libegl1 \
         libglib2.0-0 \
@@ -40,7 +41,9 @@ RUN uv pip install --python .venv/bin/python napari==0.7.0 PyQt5==5.15.11
 
 # Code + model weights (weights live in nnUNet/data/results/, see .dockerignore)
 COPY nnUNet/ ./
-RUN uv sync --frozen --no-dev
+# --inexact: don't remove packages that aren't in uv.lock (keeps napari/PyQt5,
+# which a plain `uv sync` would uninstall to make the venv match the lock exactly)
+RUN uv sync --frozen --no-dev --inexact
 
 COPY run_inference.py ./run_inference.py
 

@@ -53,6 +53,15 @@ Python virtualenv already on `PATH`.
 The container runs as non-root user `topaneu` with **passwordless sudo**
 (`sudo apt-get install ...` etc. works inside the container).
 
+**Rootless Docker: add `--user root` to every `docker run`.** Rootless mode
+remaps UIDs: *your host user* becomes root inside the container, while the
+image's `topaneu` (UID 1000) becomes an unprivileged subuid that cannot write
+to your mounted files (typically a `PermissionError` / `Permission denied` on
+the output dir, while reading still works). Running as container root is safe
+in rootless mode — it is just your own host user, and output files end up
+owned by you. The `USER_UID`/`USER_GID` build args and the advice below apply
+to regular (rootful) Docker.
+
 Mounted host files keep their host owner (UID/GID) inside the container. So:
 
 - **Build with `--build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -g)`**
@@ -116,7 +125,7 @@ docker run --rm --gpus all --ipc=host \
 | `--n_gpus` | `1` | GPUs to spread inference workers over |
 | `--overwrite_existing` | off | Re-run cases whose output already exists (default: skip them) |
 | `--vis` | off | Render napari screenshot galleries of the predictions after inference |
-| `--vis_out_dir` | `<output>_VIZ` | Where to save screenshot PNGs (mirrors sub-folder structure) |
+| `--vis_out_dir` | `<output>/viz` | Where to save screenshot PNGs (mirrors sub-folder structure) |
 | `--vis_views` | `anterior left superior x y z` | Views per gallery |
 | `--vis_grid_cols` | `3` | Gallery grid columns |
 
@@ -140,17 +149,26 @@ Pass `--vis` to `run_inference.py` to render a multi-view 3D gallery PNG per
 predicted case (prediction overlaid on the input image), using
 `nnunetv2/houjing_scripts/vis_label_screenshots_napari_multi_view.py` under
 `xvfb` (no display needed). Note: the renderer only picks up `.nii.gz` label
-files, so keep the default `--output-ext .nii.gz` when using `--vis`.
+files, so keep the default `--output_ext .nii.gz` when using `--vis`.
 
 ```bash
-python run_inference.py -i /input -o /output --vis --vis-out-dir /output_viz
+python run_inference.py -i /input -o /output --vis
 ```
+
+Screenshots go to `<output>/viz` by default, i.e. **inside the mounted output
+volume**, so they are visible on the host. If you pass `--vis_out_dir`, make
+sure it points inside a mounted path — a container-only path like `/output_viz`
+(a sibling of the `/output` mount) is lost when the container exits.
+
+A progress bar is shown during rendering, with the cumulative disk usage of the
+gallery PNGs and the free space on the target disk (also appended to each
+per-file log line).
 
 For full control (label alpha, canvas size, sampling, …) run the script directly:
 
 ```bash
 xvfb-run -a python nnunetv2/houjing_scripts/vis_label_screenshots_napari_multi_view.py \
-    --labels_dir /output --images_dir /input --out_dir /output_viz \
+    --labels_dir /output --images_dir /input --out_dir /output/viz \
     --views anterior left superior x y z --grid_cols 3 --skip_existing
 ```
 

@@ -88,7 +88,8 @@ def parse_args():
                    help='After inference, render multi-view napari screenshot galleries '
                         'of the predictions (requires xvfb, included in the image).')
     p.add_argument('--vis_out_dir', type=Path, default=None,
-                   help='Output directory for screenshots (default: <output>_VIZ).')
+                   help='Output directory for screenshots (default: <output>/viz, so it '
+                        'lands inside the mounted output volume and is visible on the host).')
     p.add_argument('--vis_views', nargs='+',
                    default=['anterior', 'left', 'superior', 'x', 'y', 'z'],
                    help='Views to render in the screenshot gallery.')
@@ -118,7 +119,10 @@ def find_cases(input_path: Path, suffix: str):
 
 
 def run_vis(args, in_dir: Path, fnames):
-    vis_out_root = args.vis_out_dir or args.output.parent / (args.output.name + '_VIZ')
+    # Default inside the output dir: /output is typically a bind mount, so a sibling
+    # like /output_VIZ would land in the container's ephemeral filesystem and be
+    # inaccessible from the host.
+    vis_out_root = args.vis_out_dir or args.output / 'viz'
     rel_dirs = sorted({os.path.dirname(f) for f in fnames})
     for rel in rel_dirs:
         labels_dir = args.output / rel if rel else args.output

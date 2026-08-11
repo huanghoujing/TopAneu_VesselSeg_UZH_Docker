@@ -26,9 +26,11 @@ an identically named ``X.nii.gz`` in ``--images_dir`` is also accepted.
 import argparse
 import math
 import os
+import shutil
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 import nibabel as nib
 from nibabel.orientations import (
     apply_orientation,
@@ -36,6 +38,13 @@ from nibabel.orientations import (
     io_orientation,
     ornt_transform,
 )
+
+
+def human_bytes(n):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return f"{n}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
 
 # Fallback platform for the rare case xvfb is unavailable; xvfb-run sets DISPLAY and
 # overrides this. Must be set before napari/Qt import.
@@ -275,8 +284,12 @@ def main():
             app.processEvents()
         return scene_canvas.render(size=size, alpha=True)
 
+    # cumulative disk usage of the gallery PNGs (incl. pre-existing ones on resume)
+    viz_bytes = sum(f.stat().st_size for f in args.out_dir.glob("*.png"))
+    pbar = tqdm(label_files, desc="viz", unit="img", dynamic_ncols=True)
+    pbar.set_postfix_str(f"viz={human_bytes(viz_bytes)}, free={human_bytes(shutil.disk_usage(args.out_dir).free)}")
     try:
-        for i, label_path in enumerate(label_files, 1):
+        for i, label_path in enumerate(pbar, 1):
             out_png = args.out_dir / f"{label_path.name[:-len('.nii.gz')]}.png"
             if args.skip_existing and out_png.exists():
                 print(f"[{i}/{len(label_files)}] skip (exists): {out_png.name}")
@@ -329,10 +342,15 @@ def main():
 
                 gallery = make_gallery(frames, names, args.grid_cols, args.pad, label=not args.no_labels)
                 iio.imwrite(out_png, gallery)
-                print(f"[{i}/{len(label_files)}] wrote {out_png.name}  ({len(frames)} views, labels={int(lbl_arr.max())})")
+                viz_bytes += out_png.stat().st_size
+                free = shutil.disk_usage(args.out_dir).free
+                pbar.set_postfix_str(f"viz={human_bytes(viz_bytes)}, free={human_bytes(free)}")
+                print(f"[{i}/{len(label_files)}] wrote {out_png.name}  ({len(frames)} views, "
+                      f"labels={int(lbl_arr.max())}, viz total={human_bytes(viz_bytes)}, disk free={human_bytes(free)})")
             except Exception as e:  # one bad file should not abort the batch
                 print(f"[{i}/{len(label_files)}] ERROR on {label_path.name}: {e}")
     finally:
+        pbar.close()
         viewer.close()
 
 
