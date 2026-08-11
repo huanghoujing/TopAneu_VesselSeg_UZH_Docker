@@ -73,6 +73,11 @@ Mounted host files keep their host owner (UID/GID) inside the container. So:
   in this mode since the anonymous UID is not in the sudoers file.)
 - If your input data is only readable by another group, add the group with
   `--group-add <gid>`.
+- **Create the output directory yourself before `docker run`** (e.g.
+  `mkdir -p /path/to/results`). If a bind-mount path does not exist, the Docker
+  daemon auto-creates it **owned by root**, and the container user then gets
+  `PermissionError: [Errno 13]` when writing to it. If that already happened,
+  fix it with `sudo chown $(id -u):$(id -g) /path/to/results`.
 
 ## Inference
 
@@ -168,3 +173,16 @@ xvfb-run -a python nnunetv2/houjing_scripts/vis_label_screenshots_napari_multi_v
   after a crash/kill, stale files there are safe to delete manually. Temp
   filenames include a hash of the relative input path, so files with the same
   basename in different sub-folders cannot collide.
+
+## Mem Requirement
+
+When I used `--memory=32g --shm-size=32g`, the PrimusV3S got stuck. With 64g, it runs smoothly.
+
+```bash
+sudo docker run --rm --gpus '"device=1"' --ipc=host \
+	  --memory=64g --shm-size=64g \
+    -v /mnt/x/data2/Project/TopCoW_Algo_Submission/task-1-seg/nnUNet_TopCoW/data/raw/topaneu_vessel/Test/images:/input \
+    -v /mnt/x/data2/Project/TopCoW_Algo_Submission/task-1-seg/nnUNet_TopCoW/data/raw/topaneu_vessel/20260811_topaneu_testset_vessel_36cls_pred:/output \
+    topaneu_vesselseg_uzh \
+    python run_inference.py -i /input -o /output --vis
+```
