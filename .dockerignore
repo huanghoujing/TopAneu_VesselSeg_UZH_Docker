@@ -1,0 +1,21 @@
+# VCS / caches
+**/.git
+**/__pycache__
+**/*.pyc
+**/.venv
+
+# Local data that must not be baked into the image
+nnUNet/data/raw
+nnUNet/data/preprocessed
+
+# Training artifacts not needed for inference (keep checkpoints + json plans + logs)
+# nnUNet/data/results/**/training_log_*.txt
+# nnUNet/data/results/**/progress.png
+# nnUNet/data/results/**/debug.json
+nnUNet/data/results/**/checkpoint_best.pth
+nnUNet/data/results/**/checkpoint_latest.pth
+nnUNet/data/results/**/validation
+
+# Docs not needed inside the image
+README.md
+nnUNet/documentation
