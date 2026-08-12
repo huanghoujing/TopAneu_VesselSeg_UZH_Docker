@@ -278,6 +278,20 @@ def main():
     scene_canvas = qt_canvas._scene_canvas
     size = tuple(args.size)
 
+    # Pin the on-screen canvas to the offscreen render size. Under xvfb (no window
+    # manager) the napari window never reaches its normal size, so the canvas stays
+    # tiny; reset_view() then fits the volume to that tiny canvas while render()
+    # draws into a bigger FBO — the 3D views come out small and anchored top-left.
+    # The canvas widget lives in the window's layout, so it must be fixed at the
+    # native Qt level (a plain vispy size assignment is overridden by the layout).
+    try:
+        scene_canvas.native.setFixedSize(*size)
+        for _ in range(5):
+            app.processEvents()
+        print(f"canvas size pinned to {tuple(scene_canvas.size)} (render size {size})")
+    except Exception as e:
+        print(f"WARN could not pin canvas size: {e}")
+
     def grab():
         qt_canvas.on_draw(None)  # bring the scenegraph up to date
         for _ in range(3):

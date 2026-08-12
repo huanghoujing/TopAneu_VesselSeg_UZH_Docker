@@ -78,8 +78,10 @@ def parse_args():
                         'instead of the parallel pipeline.')
     p.add_argument('--n_infer_workers', type=int, default=1,
                    help='Number of GPU inference workers.')
-    p.add_argument('--n_pre_post_workers', type=int, default=2,
-                   help='Number of preprocessing workers and of post-processing workers.')
+    p.add_argument('--n_pre_post_workers', type=int, default=1,
+                   help='Number of preprocessing workers and of post-processing workers. '
+                        'The default 1 is validated to fit in 64 GB container memory; '
+                        'more workers are faster but hold more cases in RAM at once.')
     p.add_argument('--n_gpus', type=int, default=1,
                    help='Number of GPUs to spread inference workers over.')
     p.add_argument('--gpu_limit_GB', type=float, default=None,

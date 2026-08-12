@@ -10,8 +10,9 @@ fold 4, `checkpoint_final.pth`), plus an optional napari-based screenshot render
 - Docker with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
   (inference runs on GPU; CPU-only is not supported)
 - A recent NVIDIA driver (the image ships PyTorch 2.13 with bundled CUDA)
-- 8 GB of GPU VRAM should be enough (we verified the default `--sequential`
-  configuration with GPU memory capped to 8 GB)
+- 16 GB of GPU VRAM recommended (the default configuration was validated with
+  GPU memory capped to 16 GB); 8 GB is enough for the slower sequential
+  fallback (validated with an 8 GB cap)
 
 ## Build
 
@@ -39,8 +40,7 @@ docker run --rm -it \
     --gpus all \
     --ipc=host \
     --user root \
-    --memory=32g --shm-size=32g \
-    -e OMP_NUM_THREADS=1 -e MKL_NUM_THREADS=1 -e OPENBLAS_NUM_THREADS=1 \
+    --memory=64g --shm-size=64g \
     -v /path/to/your/images:/input \
     -v /path/to/your/results:/output \
     topaneu_vesselseg_uzh
@@ -53,8 +53,9 @@ already on `PATH`.
 - `--ipc=host` — recommended; the inference pipeline uses multiprocessing with shared memory
 - `--user root` — required on rootless Docker (see [File permissions & sudo](#file-permissions--sudo));
   on rootful Docker you can drop it to run as the built-in `topaneu` user
-- `--memory=32g --shm-size=32g` — enough for the default (`--sequential`)
-  inference configuration; see [Higher-speed inference](#higher-speed-inference-advanced) for more
+- `--memory=64g --shm-size=64g` — validated for the default (parallel) inference
+  configuration; if you only have 32 GB to spare, use the
+  [low-memory fallback](#low-memory-fallback-sequential)
 - `-v ...:/input`, `-v ...:/output` — mount your data; any paths work, `/input` / `/output` are just conventions
 
 ## File permissions & sudo
@@ -99,16 +100,17 @@ Mounted host files keep their host owner (UID/GID) inside the container. So:
 
 ## Inference
 
-Inside the container (default, memory-safe configuration):
+Inside the container (default configuration — the parallel pipeline with one
+preprocessing, one GPU, and one post-processing worker):
 
 ```bash
 # Single NIfTI file
-python run_inference.py -i /input/case_001.nii.gz -o /output --sequential
+python run_inference.py -i /input/case_001.nii.gz -o /output
 
 # Folder: all nested *.nii.gz files are found automatically.
 # The output directory mirrors the input sub-folder structure, e.g.
 #   /input/center1/case_001.nii.gz  ->  /output/center1/case_001.nii.gz
-python run_inference.py -i /input -o /output --sequential
+python run_inference.py -i /input -o /output
 ```
 
 End-to-end (non-interactive) usage:
@@ -116,17 +118,17 @@ End-to-end (non-interactive) usage:
 ```bash
 docker run --rm --gpus all --ipc=host \
     --user root \
-    --memory=32g --shm-size=32g \
-    -e OMP_NUM_THREADS=1 -e MKL_NUM_THREADS=1 -e OPENBLAS_NUM_THREADS=1 \
+    --memory=64g --shm-size=64g \
     -v /path/to/images:/input -v /path/to/results:/output \
     topaneu_vesselseg_uzh \
-    python run_inference.py -i /input -o /output --sequential
+    python run_inference.py -i /input -o /output
 ```
 
-Tested memory bounds for the `--sequential` configuration (thread env vars at 1,
-GPU memory capped to 8 GB during the test): `--memory=16g` is OOM-killed after
-the first ensemble model, `--memory=24g` after the second, `--memory=32g` runs
-through — hence the 32g default above. 8 GB of GPU VRAM should be enough.
+This configuration was validated end-to-end on 5 example cases (mixed MR/CT cases from all
+centers): ~45 s/case on a modern GPU, GPU memory capped to 16 GB during the
+test, peak container memory well inside `--memory=64g`. With only 32 GB, the
+parallel pipeline can stall on very large CT volumes (it swaps instead of
+failing) — use the [low-memory fallback](#low-memory-fallback-sequential) then.
 
 ### Options
 
@@ -138,7 +140,7 @@ through — hence the 32g default above. 8 GB of GPU VRAM should be enough.
 | `--output_ext` | `.nii.gz` | Extension of saved segmentations |
 | `--sequential` | off | Run the pipeline sequentially in one process instead of parallel workers |
 | `--n_infer_workers` | `1` | GPU inference workers |
-| `--n_pre_post_workers` | `2` | Preprocessing workers and post-processing workers (also the queue sizes) |
+| `--n_pre_post_workers` | `1` | Preprocessing workers and post-processing workers (also the queue sizes); more is faster but holds more cases in RAM |
 | `--n_gpus` | `1` | GPUs to spread inference workers over |
 | `--gpu_limit_GB` | none | Approximate GPU memory cap in GB, applied in each inference process (works in both sequential and parallel mode) |
 | `--overwrite_existing` | off | Re-run cases whose output already exists (default: skip them) |
@@ -149,39 +151,47 @@ through — hence the 32g default above. 8 GB of GPU VRAM should be enough.
 
 ### CPU thread limits
 
-Thread counts are baked in as environment variables with default `4`; the
-recommended commands above override them to `1` (`-e OMP_NUM_THREADS=1
--e MKL_NUM_THREADS=1 -e OPENBLAS_NUM_THREADS=1`), which keeps RAM usage within
-the tested `--memory=32g` bound. Raise them the same way if you give the
-container more memory. `nnUNet_n_proc_DA=1` is also set (the pipeline does not
-use the nnU-Net dataloader).
+Thread counts (`OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`)
+are baked into the image with default `4`, which the default configuration was
+validated with. Override them at `docker run` time with `-e OMP_NUM_THREADS=1
+-e MKL_NUM_THREADS=1 -e OPENBLAS_NUM_THREADS=1`
+etc. — lower values reduce RAM pressure at the cost of slower pre/post
+processing (with threads at 1, inference took ~25% longer in our tests).
+`nnUNet_n_proc_DA=1` is also set (the pipeline does not use the nnU-Net
+dataloader).
 
-### Higher-speed inference (advanced)
+### Low-memory fallback (sequential)
 
-With more RAM, the parallel pipeline (preprocess / GPU inference / postprocess
-overlap across worker processes) is faster than `--sequential`. Example — note
-the larger memory budget and no `--gpu_limit_GB`:
+If the host cannot spare 64 GB for the container, run everything in a single
+process with reduced thread counts. Validated to fit in `--memory=32g`
+(`16g`/`24g` were OOM-killed) with GPU memory capped to 8 GB — but it is much
+slower (roughly 7 min/case vs ~45 s/case for the default configuration):
 
 ```bash
 docker run --rm --gpus all --ipc=host \
     --user root \
-    --memory=64g --shm-size=64g \
+    --memory=32g --shm-size=32g \
     -e OMP_NUM_THREADS=1 -e MKL_NUM_THREADS=1 -e OPENBLAS_NUM_THREADS=1 \
     -v /path/to/images:/input -v /path/to/results:/output \
     topaneu_vesselseg_uzh \
-    python run_inference.py -i /input -o /output \
-        --n_infer_workers 1 --n_pre_post_workers 2 \
-        --suffix _0000.nii.gz --output_ext .nii.gz
+    python run_inference.py -i /input -o /output --sequential
 ```
 
-(The `--suffix _0000.nii.gz` here strips the nnU-Net channel suffix from output
-names: `case_0000.nii.gz` -> `case.nii.gz`. Use the plain default `.nii.gz` if
-your files are not channel-suffixed.)
+Do NOT run the parallel (default) pipeline with only 32 GB: on very large CT
+volumes it exceeds the limit and stalls in swap instead of failing cleanly.
 
-Observed on this pipeline: with `--memory=32g --shm-size=32g` the parallel run
-got stuck at the PrimusV3S model; with 64g it runs smoothly. If the container
-is OOM-killed or hangs, fall back to the default `--sequential` configuration,
-which is tested to fit in 32g.
+### Scaling up (advanced)
+
+- `--n_pre_post_workers 2` (or more) overlaps more preprocessing/postprocessing
+  with GPU work — each extra worker holds additional cases in RAM, so raise
+  `--memory` accordingly.
+- `--n_gpus N` with `--n_infer_workers N` spreads inference workers over
+  multiple GPUs.
+
+### Strip Channel Sub-String from Prediction Output Filename
+
+- `--suffix _0000.nii.gz` strips the nnU-Net channel suffix from output names
+  (`case_0000.nii.gz` -> `case.nii.gz`).
 
 ## Screenshot visualization (optional)
 
@@ -204,10 +214,14 @@ A progress bar is shown during rendering, with the cumulative disk usage of the
 gallery PNGs and the free space on the target disk (also appended to each
 per-file log line).
 
-For full control (label alpha, canvas size, sampling, …) run the script directly:
+For full control (label alpha, canvas size, sampling, …) run the script
+directly. Start `Xvfb` explicitly rather than through `xvfb-run` — as the
+container's first process, `xvfb-run` can hang forever waiting for the X
+server's readiness signal:
 
 ```bash
-xvfb-run -a python nnunetv2/houjing_scripts/vis_label_screenshots_napari_multi_view.py \
+Xvfb :99 -screen 0 1280x1024x24 &
+DISPLAY=:99 python nnunetv2/houjing_scripts/vis_label_screenshots_napari_multi_view.py \
     --labels_dir /output --images_dir /input --out_dir /output/viz \
     --views anterior left superior x y z --grid_cols 3 --skip_existing
 ```
@@ -249,16 +263,15 @@ On the target machine (needs Docker + NVIDIA Container Toolkit + NVIDIA driver):
 # 1. load the image (one-time; the tar can be deleted afterwards)
 docker load -i topaneu_vesselseg_uzh.tar
 
-# 2. run inference (default, memory-safe configuration)
+# 2. run inference (default configuration)
 #    Optional: also render screenshot galleries (adds --vis; PNGs land in /output/viz)
 mkdir -p /path/to/results
 docker run --rm --gpus all --ipc=host \
     --user root \
-    --memory=32g --shm-size=32g \
-    -e OMP_NUM_THREADS=1 -e MKL_NUM_THREADS=1 -e OPENBLAS_NUM_THREADS=1 \
+    --memory=64g --shm-size=64g \
     -v /path/to/images:/input -v /path/to/results:/output \
     topaneu_vesselseg_uzh \
-    python run_inference.py -i /input -o /output --sequential #--vis
+    python run_inference.py -i /input -o /output #--vis
 
 ```
 

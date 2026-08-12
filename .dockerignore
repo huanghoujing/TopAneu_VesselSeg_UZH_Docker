@@ -9,6 +9,9 @@ nnUNet/data/raw
 nnUNet/data/preprocessed
 nnUNet/data/tmp
 
+# Exported image tars (would bloat the build context enormously)
+*.tar
+
 # Training artifacts not needed for inference (keep checkpoints + json plans + logs)
 # nnUNet/data/results/**/training_log_*.txt
 # nnUNet/data/results/**/progress.png
