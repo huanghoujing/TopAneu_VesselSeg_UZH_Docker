@@ -181,13 +181,31 @@ def preprocess_worker(queue1, fnames, in_dir, out_dir, suffix, output_ext, plans
             logger.info(f"[preprocess_worker] Error processing {input_file}: {e}")
             traceback.print_exc()
 
+def limit_gpu_memory(target_gb, device_index=0):
+    """Cap the CUDA caching allocator of THIS process to ~target_gb gigabytes.
+
+    torch.cuda.set_per_process_memory_fraction is per-process, and calling it
+    initializes CUDA — which must NOT happen in the parent before forking GPU
+    workers (forked children cannot re-initialize CUDA). Therefore call this
+    inside each process that runs inference: the inference workers in parallel
+    mode, or the main process in sequential mode.
+    """
+    total_mem = torch.cuda.get_device_properties(device_index).total_memory
+    fraction = min(max((target_gb * 1024**3) / total_mem, 0.0), 1.0)
+    torch.cuda.set_per_process_memory_fraction(fraction, device_index)
+    logger.info(f"[GPU {device_index}] Limiting memory to ~{target_gb:.2f} GB "
+                f"({fraction * 100:.1f}% of {total_mem / 1024**3:.2f} GB total).")
+
+
 @torch.inference_mode()
-def inference_worker(model_cfg, predictor_class, use_mirroring, queue1, queue2, tmp_folder, verbose=False, device_id=0):
+def inference_worker(model_cfg, predictor_class, use_mirroring, queue1, queue2, tmp_folder, verbose=False, device_id=0, gpu_limit_GB=None):
     """
     Created in child process. Build predictors here (do not receive them from parent).
     Load preprocessed npz from tmp_folder, run predictors, push seg to queue2.
     """
     try:
+        if gpu_limit_GB:
+            limit_gpu_memory(gpu_limit_GB, device_id)
         # Create predictors inside this process
         predictors = get_predictors(model_cfg=model_cfg, predictor_class=predictor_class, use_mirroring=use_mirroring, device_id=device_id)
     except Exception as e:
@@ -542,12 +560,17 @@ def infer_folder(
     skip_existing=False,
     sequential=False,
     queue1_size=12, queue2_size=12, n_preprocess_workers=6, n_infer_workers=1, n_post_inference_workers=6,
-    n_gpus=1
+    n_gpus=1, gpu_limit_GB=None
 ):
     st0 = time.time()
 
     # Only create predictors here if running sequentially (so we avoid pickling GPU objects).
     if sequential:
+        # Sequential: inference runs in this process, so the cap is set here. In parallel
+        # mode it is set inside each inference_worker instead (setting it here would
+        # initialize CUDA in the parent and break the forked GPU workers).
+        if gpu_limit_GB:
+            limit_gpu_memory(gpu_limit_GB, 0)
         predictors = get_predictors(model_cfg=model_cfg, predictor_class=predictor_class, use_mirroring=use_mirroring)
     else:
         predictors = None
@@ -637,7 +660,7 @@ def infer_folder(
         infer_processes = []
         for i in range(max(1, n_infer_workers)):
             # Distribute inference workers onto GPUs in round-robin fashion
-            p = Process(target=inference_worker, args=(model_cfg, predictor_class, use_mirroring, queue1, queue2, tmp_folder, False, i%n_gpus))
+            p = Process(target=inference_worker, args=(model_cfg, predictor_class, use_mirroring, queue1, queue2, tmp_folder, False, i%n_gpus, gpu_limit_GB))
             p.start()
             infer_processes.append(p)
 

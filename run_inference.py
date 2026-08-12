@@ -22,7 +22,6 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-import torch
 
 REPO_ROOT = Path(__file__).resolve().parent
 
@@ -84,7 +83,10 @@ def parse_args():
     p.add_argument('--n_gpus', type=int, default=1,
                    help='Number of GPUs to spread inference workers over.')
     p.add_argument('--gpu_limit_GB', type=float, default=None,
-                   help='Limit GPU memory usage to approximately `target_gb` gigabytes (default: None, no limit)')
+                   help='Limit GPU memory usage to approximately this many gigabytes '
+                        '(default: no limit). Applied inside each process that runs '
+                        'inference, so it works with both --sequential and the '
+                        'parallel pipeline.')
     p.add_argument('--overwrite_existing', action='store_true',
                    help='Re-run cases whose output file already exists (default: skip them).')
     p.add_argument('--vis', action='store_true',
@@ -148,32 +150,8 @@ def run_vis(args, in_dir: Path, fnames):
     print(f"\nScreenshots saved to: {vis_out_root}")
 
 
-def limit_gpu_memory(target_gb: float, device_index: int = 0):
-    """
-    Limit PyTorch GPU memory usage to approximately `target_gb` gigabytes.
-    
-    Parameters
-    ----------
-    target_gb : float
-        Desired GPU memory limit in GB (approximate).
-    device_index : int, optional
-        GPU device index (default = 0).
-    """
-    device = torch.device(f'cuda:{device_index}')
-    total_mem = torch.cuda.get_device_properties(device).total_memory
-    fraction = (target_gb * 1024**3) / total_mem
-    fraction = min(max(fraction, 0.0), 1.0)  # clamp between 0 and 1
-
-    torch.cuda.set_per_process_memory_fraction(fraction, device)
-    print(f"[GPU {device_index}] Limiting memory to ~{target_gb:.2f} GB "
-          f"({fraction * 100:.1f}% of {total_mem / 1024**3:.2f} GB total).")
-
-
 def main():
     args = parse_args()
-
-    for idx in range(args.n_gpus):
-        limit_gpu_memory(target_gb=args.gpu_limit_GB, device_index=idx)
 
     in_dir, fnames = find_cases(args.input, args.suffix)
     if not fnames:
@@ -200,6 +178,7 @@ def main():
         queue1_size=args.n_pre_post_workers,
         queue2_size=args.n_pre_post_workers,
         n_gpus=args.n_gpus,
+        gpu_limit_GB=args.gpu_limit_GB,
         use_mirroring=True,
         post_process=True,
         skip_existing=not args.overwrite_existing,
