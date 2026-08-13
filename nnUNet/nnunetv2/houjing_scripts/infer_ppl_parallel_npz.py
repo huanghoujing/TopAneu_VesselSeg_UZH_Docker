@@ -122,6 +122,47 @@ def prob_to_seg(prob, *args, **kwargs):
     # return (prob[1] > 0.2).astype(np.uint8)
     return np.argmax(prob, axis=0).astype(np.uint8)
 
+@torch.inference_mode()
+def predict_and_fuse(predictors, preprocessed_dicts, plans_managers, configuration_managers, label_managers, fuse_logits=False, verbose=False):
+    """Predict all models on one preprocessed case and fuse into a full-resolution probability map.
+
+    fuse_logits=False: per model resample logits + softmax + revert crop, then arithmetic
+    mean of the full-resolution probability maps (the original ensemble).
+    fuse_logits=True: mean of the logits on the preprocessed grid, then a single
+    resample + softmax + revert crop. Requires all models to share the same preprocessing
+    geometry (target spacing, transpose, cropping); fusion semantics change from
+    mean-of-softmax to softmax-of-mean-logits.
+
+    Returns None if there is nothing to predict.
+    """
+    prob = 0
+    fused_logits = None
+    n = 0
+    for predictor, dct, pm, cm, lm in zip(predictors, preprocessed_dicts, plans_managers, configuration_managers, label_managers):
+        data = dct['data']
+        if not isinstance(data, torch.Tensor):
+            data = torch.from_numpy(np.ascontiguousarray(data))
+        _logits = predictor.predict_logits_from_preprocessed_data(data, reload_model_weight=False, to_cpu=True)
+        if fuse_logits:
+            fused_logits = _logits.float() if fused_logits is None else fused_logits + _logits.float()
+        else:
+            _prob = convert_predicted_logits_to_prob_with_correct_shape(_logits, pm, cm, lm, dct.get('data_properties', {}))
+            if verbose:
+                print(f"[predict_and_fuse] one predictor output {_prob.shape = }")
+            prob += _prob
+        n += 1
+        del _logits
+    if n == 0:
+        return None
+    if fuse_logits:
+        fused_logits /= n
+        prob = convert_predicted_logits_to_prob_with_correct_shape(
+            fused_logits, plans_managers[0], configuration_managers[0], label_managers[0],
+            preprocessed_dicts[0].get('data_properties', {}))
+    else:
+        prob /= n
+    return prob
+
 def preprocess_worker(queue1, fnames, in_dir, out_dir, suffix, output_ext, plans_managers, dataset_jsons, configuration_managers, tmp_folder, verbose=False):
     """
     Preprocess images and save per-sample preprocessed dicts into compressed npz files in tmp_folder.
@@ -198,10 +239,16 @@ def limit_gpu_memory(target_gb, device_index=0):
 
 
 @torch.inference_mode()
-def inference_worker(model_cfg, predictor_class, use_mirroring, queue1, queue2, tmp_folder, verbose=False, device_id=0, gpu_limit_GB=None):
+def inference_worker(model_cfg, predictor_class, use_mirroring, queue1, queue2, tmp_folder, verbose=False, device_id=0, gpu_limit_GB=None, fuse_logits=False):
     """
     Created in child process. Build predictors here (do not receive them from parent).
     Load preprocessed npz from tmp_folder, run predictors, push seg to queue2.
+
+    fuse_logits=True averages the models' logits on the preprocessed grid and runs
+    resample+softmax+crop-revert once, instead of once per model. Requires all models
+    to share the same preprocessing geometry (target spacing, transpose, cropping).
+    Note the fusion semantics change from arithmetic mean of probabilities to
+    softmax of mean logits.
     """
     try:
         if gpu_limit_GB:
@@ -280,19 +327,10 @@ def inference_worker(model_cfg, predictor_class, use_mirroring, queue1, queue2, 
                 print(f"[inference_worker] Predicting {input_file} ...")
                 print(f"\tcasename: {casename}")
 
-            prob = 0
-            n = 0
-            for predictor, dct, pm, cm, lm in zip(predictors, preprocessed_dicts, plans_managers, configuration_managers, label_managers):
-                _logits = predictor.predict_logits_from_preprocessed_data(dct['data'], reload_model_weight=False, to_cpu=True)
-                _prob = convert_predicted_logits_to_prob_with_correct_shape(_logits, pm, cm, lm, dct.get('data_properties', {}))
-                if verbose:
-                    print(f"[inference_worker] one predictor output {_prob.shape = }")
-                prob += _prob
-                n += 1
-            if n == 0:
+            prob = predict_and_fuse(predictors, preprocessed_dicts, plans_managers, configuration_managers, label_managers, fuse_logits=fuse_logits, verbose=verbose)
+            if prob is None:
                 logger.info("[inference_worker] No predictors or no preprocessed dicts, skipping sample")
                 continue
-            prob /= n
             seg = prob_to_seg(prob)
             del prob
 
@@ -507,7 +545,7 @@ def post_process_folder(in_dir, out_dir, suffix='.nii.gz', post_process_func=Non
     logger.info(f"Post-processing done, {time.time()-st :.0f}s")
 
 @torch.inference_mode()
-def infer_one_sample(input_file, output_file, casename, predictors, post_process=True, prune_fn_name='rm_small', post_process_func=None):
+def infer_one_sample(input_file, output_file, casename, predictors, post_process=True, prune_fn_name='rm_small', post_process_func=None, fuse_logits=False):
     print(f"Predicting {input_file} ...")
     print(f"\tcasename: {casename}")
 
@@ -521,15 +559,21 @@ def infer_one_sample(input_file, output_file, casename, predictors, post_process
     props = { 'spacing': spacing_for_nnunet }
     print(f"[*] ITK image spacing after x-z Transposed: {spacing_for_nnunet}")
 
-    print("[*] prediction...")
-
-    prob = 0
-    n = 0
+    print("[*] preprocessing...")
+    preprocessed_dicts = []
     for predictor in predictors:
-        _, _prob = predictor.predict_single_npy_array(input_array, props, None, None, True)
-        prob += _prob
-        n += 1
-    prob /= n
+        ppa = PreprocessAdapterFromNpy([input_array], [None], [props], [None],
+                                       predictor.plans_manager, predictor.dataset_json, predictor.configuration_manager,
+                                       num_threads_in_multithreaded=1, verbose=False)
+        preprocessed_dicts.append(next(ppa))
+
+    print("[*] prediction...")
+    prob = predict_and_fuse(
+        predictors, preprocessed_dicts,
+        [p.plans_manager for p in predictors],
+        [p.configuration_manager for p in predictors],
+        [p.label_manager for p in predictors],
+        fuse_logits=fuse_logits)
     print(f"[*] Ensemble fused prob shape: {prob.shape}")
 
     seg = prob_to_seg(prob)
@@ -560,7 +604,7 @@ def infer_folder(
     skip_existing=False,
     sequential=False,
     queue1_size=12, queue2_size=12, n_preprocess_workers=6, n_infer_workers=1, n_post_inference_workers=6,
-    n_gpus=1, gpu_limit_GB=None
+    n_gpus=1, gpu_limit_GB=None, fuse_logits=False
 ):
     st0 = time.time()
 
@@ -609,7 +653,7 @@ def infer_folder(
             input_file = os.path.join(in_dir, fname+suffix)
             output_file = os.path.join(out_dir, fname+output_ext)
             casename = os.path.basename(input_file).replace(suffix, '')
-            infer_one_sample(input_file, output_file, casename, predictors, post_process=post_process, prune_fn_name=prune_fn_name, post_process_func=post_process_func)
+            infer_one_sample(input_file, output_file, casename, predictors, post_process=post_process, prune_fn_name=prune_fn_name, post_process_func=post_process_func, fuse_logits=fuse_logits)
             logger.info(f"Infer {i+1}/{len(fnames)} done, {time.time()-st :.0f}s")
     else:
         # Use multiprocessing with queues for parallel processing
@@ -660,7 +704,7 @@ def infer_folder(
         infer_processes = []
         for i in range(max(1, n_infer_workers)):
             # Distribute inference workers onto GPUs in round-robin fashion
-            p = Process(target=inference_worker, args=(model_cfg, predictor_class, use_mirroring, queue1, queue2, tmp_folder, False, i%n_gpus, gpu_limit_GB))
+            p = Process(target=inference_worker, args=(model_cfg, predictor_class, use_mirroring, queue1, queue2, tmp_folder, False, i%n_gpus, gpu_limit_GB, fuse_logits))
             p.start()
             infer_processes.append(p)
 

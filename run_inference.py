@@ -89,6 +89,12 @@ def parse_args():
                         '(default: no limit). Applied inside each process that runs '
                         'inference, so it works with both --sequential and the '
                         'parallel pipeline.')
+    p.add_argument('--fuse_logits', action='store_true',
+                   help='Ensemble by averaging model logits on the preprocessed grid and '
+                        'resampling once, instead of resampling each model\'s output '
+                        '(~3x faster export stage). Changes fusion from mean-of-softmax '
+                        'to softmax-of-mean-logits; segmentations may differ slightly '
+                        'at structure boundaries.')
     p.add_argument('--overwrite_existing', action='store_true',
                    help='Re-run cases whose output file already exists (default: skip them).')
     p.add_argument('--vis', action='store_true',
@@ -181,6 +187,7 @@ def main():
         queue2_size=args.n_pre_post_workers,
         n_gpus=args.n_gpus,
         gpu_limit_GB=args.gpu_limit_GB,
+        fuse_logits=args.fuse_logits,
         use_mirroring=True,
         post_process=True,
         skip_existing=not args.overwrite_existing,
