@@ -9,7 +9,10 @@ fold 4, `checkpoint_final.pth`), plus an optional napari-based screenshot render
 
 - Docker with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
   (inference runs on GPU; CPU-only is not supported)
-- A recent NVIDIA driver (the image ships PyTorch 2.13 with bundled CUDA)
+- NVIDIA driver r570.26 or newer (the image ships PyTorch 2.11 with bundled
+  CUDA 12.8; no CUDA installation is needed on the host). Why CUDA 12.8 and
+  what it costs in image size:
+  [docs/20260814_cuda128_driver570_compatibility.md](docs/20260814_cuda128_driver570_compatibility.md)
 - 16 GB of GPU VRAM recommended (the default configuration was validated with
   GPU memory capped to 16 GB; observed peak was ~7 GB in limited tested cases)
 

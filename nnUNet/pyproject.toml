@@ -30,7 +30,13 @@ keywords = [
     'nnunet'
 ]
 dependencies = [
-    "torch>=2.1.2",
+    # <2.12: newer PyPI builds bundle CUDA 13, which needs driver >=580.
+    # We pin to CUDA 12.8 builds (see [tool.uv.sources]) so driver 570 works.
+    "torch>=2.1.2,<2.12",
+    # Direct dep (normally pulled in via timm) so [tool.uv.sources] can pin it
+    # to the CUDA 12.8 build matching torch; a CUDA 13 torchvision would fail
+    # to load against cu128 torch.
+    "torchvision",
     "acvl-utils>=0.2,<0.3",  # 0.3 may bring breaking changes. Careful!
     "dynamic-network-architectures>=0.4.4,<0.5",  # bumped to 0.4.4 for Primus + EVA; UNetDecoder verified compatible
     "tqdm",
@@ -90,6 +96,17 @@ dev = [
     "ruff",
     "pre-commit"
 ]
+
+# CUDA 12.8 wheels for torch/torchvision on Linux: works with NVIDIA driver
+# r570 (CUDA 13 wheels from PyPI need r580+). Other platforms keep PyPI wheels.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.setuptools.packages.find]
 include = ["nnunetv2*"]
