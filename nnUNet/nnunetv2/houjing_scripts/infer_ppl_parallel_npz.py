@@ -219,13 +219,25 @@ def predict_and_fuse(predictors, preprocessed_dicts, plans_managers, configurati
     pm, cm, lm = plans_managers[0], configuration_managers[0], label_managers[0]
     props = preprocessed_dicts[0].get('data_properties', {})
 
+    if fuse_logits:
+        # logits can only be averaged on a shared grid; identical shapes alone are not
+        # proof (different spacings can round to the same shape), so check the plans
+        spacings = [tuple(c.spacing) for c in configuration_managers[:n]]
+        transposes = [tuple(p.transpose_backward) for p in plans_managers[:n]]
+        if len(set(spacings)) > 1 or len(set(transposes)) > 1:
+            raise ValueError(
+                f"fuse_logits requires all models to share the same preprocessing target "
+                f"spacing and transpose; got spacings={spacings}, transposes={transposes}")
+
     if streamed:
         try:
-            current_spacing = cm.spacing if \
-                len(cm.spacing) == len(props['shape_after_cropping_and_before_resampling']) else \
-                [props['spacing'][0], *cm.spacing]
-            do_sep, _ = determine_do_sep_z_and_axis(None, current_spacing, props['spacing'])
-            streamed = not do_sep and not lm.has_regions
+            do_sep = False
+            for _cm in configuration_managers[:n]:
+                current_spacing = _cm.spacing if \
+                    len(_cm.spacing) == len(props['shape_after_cropping_and_before_resampling']) else \
+                    [props['spacing'][0], *_cm.spacing]
+                do_sep = do_sep or determine_do_sep_z_and_axis(None, current_spacing, props['spacing'])[0]
+            streamed = not do_sep and not any(l.has_regions for l in label_managers[:n])
         except Exception:
             streamed = False
         if not streamed:

@@ -98,17 +98,30 @@ They compose (channels within a slab), but a ≤256 MB slab makes that unnecessa
 one bilinear call per slab is also faster than 37 small ones. The old per-channel
 loop now only matters in the fallback paths.
 
-Could per-channel match per-slab's peak? In principle yes: the dominant pair
-(accumulator + sliding-window logits) is a floor set by the pipeline structure —
-logits are produced atomically by sliding-window inference, the accumulator must
-persist across models — so it is shared by every chunk axis; only the transients
-differ. But per-channel has to work around the channel-coupled softmax: either a
-full 37-channel resampled temp (the existing `torch.cat` loop — which is exactly
-the tensor to avoid), or an online softmax (running per-voxel max + log-sum-exp
-buffers, then a second normalize-and-accumulate pass) at 2× resample compute. The
-single-source argmax case chunks per-channel cheaply (running best-value/
-best-index buffers). Per-slab was chosen because softmax/mean/argmax fuse into
-channel-complete slabs with zero extra state in a single pass.
+Could per-channel match per-slab's peak? Yes — with progressive reclamation, a
+per-channel scheme reaches the same complexity class (one 37-channel volume +
+accumulator at peak): resample channel by channel while freeing each consumed
+source channel (source shrinks as the full-res buffer grows, so the phase peaks
+at exactly one complete full-res buffer), softmax that buffer in place, add it
+into the accumulator in place. Single resample pass, stock per-channel
+`F.interpolate` (bit-exact per channel), no online-softmax machinery needed.
+Two caveats versus per-slab:
+
+- **Constant factor**: the volume coexisting with the accumulator is the
+  *full-res* one rather than the *preprocessed* one. With these models
+  (preprocessing coarser than the originals, so full-res has more voxels):
+  MR 7.9 vs 4.5 GB, CT 11.7 vs 9.1 GB → peak ≈ 15.7 / 23.8 GB vs the measured
+  13.4 / 21.9 GB for per-slab. Same class, worse constants here; the comparison
+  narrows or flips where preprocessing upsamples less.
+- **Tensor granularity**: freeing "one channel at a time" is impossible on the
+  contiguous logits tensor the sliding-window predictor returns — a slice of one
+  allocation cannot be released. True per-channel reclamation requires the
+  predictor to accumulate into 37 separate per-channel tensors (surgery inside
+  `predict_sliding_window_return_logits`); otherwise source + growing buffer +
+  accumulator briefly coexist (~16.3 GB MR, worse than per-slab).
+
+Per-slab was chosen because softmax/mean/argmax fuse into channel-complete slabs
+with zero extra state, in a single pass, without touching the predictor.
 
 ## fp16 (default ON, `--no-fp16` to disable)
 
@@ -197,5 +210,5 @@ now only a low-VRAM (<16 GB GPU) fallback.
 | flag | default | effect |
 |---|---|---|
 | `--fp16` / `--no-fp16` | on | fp16 accumulator / fused logits; diffs below GPU noise |
-| `--fuse_logits` | off | softmax-of-mean-logits fusion, 1 resample; ~2× faster, slightly conservative at boundaries; drops tiny uncertain structures slightly more often |
+| `--fuse_logits` | off | softmax-of-mean-logits fusion, 1 resample; ~2× faster, slightly conservative at boundaries; drops tiny uncertain structures slightly more often. Only valid when all models share the same preprocessing target spacing/transpose (true for the built-in ensemble; enforced at runtime — matching shapes alone are no proof, different spacings can round to the same shape) |
 | (internal) `streamed` | on | slab-streamed export; auto-fallback for separate-z plans / region labels |

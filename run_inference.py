@@ -94,7 +94,9 @@ def parse_args():
                         'resampling once, instead of resampling each model\'s output '
                         '(~3x faster export stage). Changes fusion from mean-of-softmax '
                         'to softmax-of-mean-logits; segmentations may differ slightly '
-                        'at structure boundaries.')
+                        'at structure boundaries. Requires all ensemble models to share '
+                        'the same preprocessing target spacing (true for the built-in '
+                        '3-model ensemble; enforced at runtime).')
     p.add_argument('--fp16', default=True, action=argparse.BooleanOptionalAction,
                    help='Keep the ensemble probability accumulator (and with --fuse_logits '
                         'the fused logits) in float16, roughly halving its RAM. Argmax '
