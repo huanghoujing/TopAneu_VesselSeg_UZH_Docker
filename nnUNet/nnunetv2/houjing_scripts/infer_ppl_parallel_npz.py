@@ -80,6 +80,8 @@ from nnunetv2.utilities.file_path_utilities import subfiles
 from nnunetv2.paths import nnUNet_raw, nnUNet_preprocessed, nnUNet_results
 from nnunetv2.inference.data_iterators import PreprocessAdapterFromNpy
 from nnunetv2.inference.export_prediction import convert_predicted_logits_to_prob_with_correct_shape
+from nnunetv2.preprocessing.resampling.default_resampling import determine_do_sep_z_and_axis
+import torch.nn.functional as F
 
 def get_predictors(model_cfg, predictor_class, use_mirroring, device_id=0):
     predictors = []
@@ -122,46 +124,152 @@ def prob_to_seg(prob, *args, **kwargs):
     # return (prob[1] > 0.2).astype(np.uint8)
     return np.argmax(prob, axis=0).astype(np.uint8)
 
-@torch.inference_mode()
-def predict_and_fuse(predictors, preprocessed_dicts, plans_managers, configuration_managers, label_managers, fuse_logits=False, verbose=False):
-    """Predict all models on one preprocessed case and fuse into a full-resolution probability map.
+def _resample_slab_trilinear(src, z0, z1, d_out, hw_out):
+    """Trilinear-resample target-grid z-slab [z0, z1) from the full source volume src (C, d, h, w).
 
-    fuse_logits=False: per model resample logits + softmax + revert crop, then arithmetic
-    mean of the full-resolution probability maps (the original ensemble).
-    fuse_logits=True: mean of the logits on the preprocessed grid, then a single
-    resample + softmax + revert crop. Requires all models to share the same preprocessing
-    geometry (target spacing, transpose, cropping); fusion semantics change from
-    mean-of-softmax to softmax-of-mean-logits.
-
-    Returns None if there is nothing to predict.
+    Reproduces F.interpolate(src, (d_out, *hw_out), mode='trilinear', align_corners=False,
+    antialias=False) restricted to the slab, via the separable 1D-z lerp + 2D bilinear
+    decomposition (exact up to float rounding order). Computes in float32 regardless of
+    src dtype. Returns (C, z1-z0, *hw_out) float32.
     """
-    prob = 0
-    fused_logits = None
-    n = 0
-    for predictor, dct, pm, cm, lm in zip(predictors, preprocessed_dicts, plans_managers, configuration_managers, label_managers):
-        data = dct['data']
-        if not isinstance(data, torch.Tensor):
-            data = torch.from_numpy(np.ascontiguousarray(data))
-        _logits = predictor.predict_logits_from_preprocessed_data(data, reload_model_weight=False, to_cpu=True)
-        if fuse_logits:
-            fused_logits = _logits.float() if fused_logits is None else fused_logits + _logits.float()
-        else:
-            _prob = convert_predicted_logits_to_prob_with_correct_shape(_logits, pm, cm, lm, dct.get('data_properties', {}))
-            if verbose:
-                print(f"[predict_and_fuse] one predictor output {_prob.shape = }")
-            prob += _prob
-        n += 1
-        del _logits
+    C, d_in, h_in, w_in = src.shape
+    if d_out == d_in:
+        lerped = src[:, z0:z1].float()
+    else:
+        # align_corners=False mapping: src_coord = (dst + 0.5) * (in / out) - 0.5
+        zc = (torch.arange(z0, z1, dtype=torch.float64) + 0.5) * (d_in / d_out) - 0.5
+        zf = torch.floor(zc)
+        w = (zc - zf).float().view(1, -1, 1, 1)
+        i0 = zf.long().clamp_(0, d_in - 1)
+        i1 = (zf.long() + 1).clamp_(0, d_in - 1)
+        lerped = src[:, i0].float() * (1 - w) + src[:, i1].float() * w
+    if (h_in, w_in) == tuple(hw_out):
+        return lerped.contiguous()
+    nz = lerped.shape[1]
+    return F.interpolate(lerped.reshape(1, C * nz, h_in, w_in), size=tuple(hw_out),
+                         mode='bilinear', antialias=False).reshape(C, nz, *hw_out)
+
+
+# z-slab thickness is chosen so one full-resolution slab buffer stays below this
+_SLAB_BUDGET_BYTES = 256 * 1024 ** 2
+
+def _streamed_seg_from_sources(sources, n_sources, pm, cm, lm, props, fp16=False):
+    """Fuse logits sources into a segmentation without materializing any full-resolution
+    float volume per source.
+
+    sources yields n_sources logits tensors (C, d, h, w) on the shared preprocessed grid
+    (consumed lazily, one resident at a time). Each source is streamed in z-slabs through
+    resample + softmax into a running sum (n_sources > 1), or argmaxed directly per slab
+    (n_sources == 1, softmax skipped: it is monotone per voxel so the argmax is unchanged).
+    The sum is not divided by n_sources before the argmax for the same reason.
+    Returns the segmentation as uint8 in the original array layout.
+    """
+    new_shape = [int(i) for i in props['shape_after_cropping_and_before_resampling']]
+    d_out, h_out, w_out = new_shape
+    acc = None
+    seg_cropped = np.empty(new_shape, dtype=np.uint8)
+    for src in sources:
+        C = src.shape[0]
+        nz = min(d_out, max(1, _SLAB_BUDGET_BYTES // (C * h_out * w_out * 4)))
+        if n_sources > 1 and acc is None:
+            acc = torch.zeros((C, *new_shape), dtype=torch.float16 if fp16 else torch.float32)
+        for z0 in range(0, d_out, nz):
+            z1 = min(z0 + nz, d_out)
+            slab = _resample_slab_trilinear(src, z0, z1, d_out, (h_out, w_out))
+            if n_sources == 1:
+                seg_cropped[z0:z1] = torch.argmax(slab, dim=0).numpy().astype(np.uint8)
+            else:
+                acc[:, z0:z1] += lm.apply_inference_nonlin(slab).to(acc.dtype)
+            del slab
+        del src
+    if acc is not None:
+        for z0 in range(0, d_out, nz):
+            z1 = min(z0 + nz, d_out)
+            seg_cropped[z0:z1] = torch.argmax(acc[:, z0:z1], dim=0).numpy().astype(np.uint8)
+        del acc
+
+    # revert cropping: outside the bbox the reference pipeline pads background prob 1
+    # (revert_cropping_on_probabilities), whose argmax is label 0
+    seg_full = np.zeros([int(i) for i in props['shape_before_cropping']], dtype=np.uint8)
+    seg_full[tuple(slice(b[0], b[1]) for b in props['bbox_used_for_cropping'])] = seg_cropped
+    return seg_full.transpose(pm.transpose_backward)
+
+
+@torch.inference_mode()
+def predict_and_fuse(predictors, preprocessed_dicts, plans_managers, configuration_managers, label_managers, fuse_logits=False, fp16=False, streamed=True, verbose=False):
+    """Predict all models on one preprocessed case and fuse into a segmentation (uint8,
+    original array layout). Returns None if there is nothing to predict.
+
+    fuse_logits=False: per model resample logits + softmax, then arithmetic mean of the
+    full-resolution probability maps (the original ensemble semantics).
+    fuse_logits=True: mean of the logits on the preprocessed grid, then a single
+    resample (+ softmax). Requires all models to share the same preprocessing geometry
+    (target spacing, transpose, cropping); fusion semantics change from mean-of-softmax
+    to softmax-of-mean-logits. fp16 additionally keeps the fused logits in float16.
+
+    streamed=True (default) processes the resample/softmax/argmax in z-slabs so no
+    full-resolution float volume is materialized per model (with fuse_logits, none at
+    all); output is equivalent to the full-volume path up to float rounding order.
+    Falls back to the full-volume path when the plans would use separate-z resampling
+    or region-based labels, where the slab decomposition does not apply.
+    """
+    n = min(len(predictors), len(preprocessed_dicts))
     if n == 0:
         return None
+    pm, cm, lm = plans_managers[0], configuration_managers[0], label_managers[0]
+    props = preprocessed_dicts[0].get('data_properties', {})
+
+    if streamed:
+        try:
+            current_spacing = cm.spacing if \
+                len(cm.spacing) == len(props['shape_after_cropping_and_before_resampling']) else \
+                [props['spacing'][0], *cm.spacing]
+            do_sep, _ = determine_do_sep_z_and_axis(None, current_spacing, props['spacing'])
+            streamed = not do_sep and not lm.has_regions
+        except Exception:
+            streamed = False
+        if not streamed:
+            logger.info("[predict_and_fuse] separate-z resampling or region labels: falling back to full-volume export")
+
+    def iter_logits():
+        for predictor, dct in zip(predictors, preprocessed_dicts):
+            data = dct['data']
+            if not isinstance(data, torch.Tensor):
+                data = torch.from_numpy(np.ascontiguousarray(data))
+            logits = predictor.predict_logits_from_preprocessed_data(data, reload_model_weight=False, to_cpu=True).float()
+            dct['data'] = None  # free preprocessed data as soon as it is consumed
+            del data
+            yield logits
+            # on resume, drop this frame's reference before the next model predicts;
+            # otherwise the previous logits stay alive throughout that prediction
+            del logits
+
     if fuse_logits:
-        fused_logits /= n
-        prob = convert_predicted_logits_to_prob_with_correct_shape(
-            fused_logits, plans_managers[0], configuration_managers[0], label_managers[0],
-            preprocessed_dicts[0].get('data_properties', {}))
-    else:
-        prob /= n
-    return prob
+        fused = None
+        for logits in iter_logits():
+            logits = logits.half() if fp16 else logits
+            fused = logits if fused is None else fused + logits
+            del logits
+        fused /= n
+        if streamed:
+            return _streamed_seg_from_sources(iter([fused]), 1, pm, cm, lm, props, fp16=fp16)
+        prob = convert_predicted_logits_to_prob_with_correct_shape(fused.float(), pm, cm, lm, props)
+        del fused
+        return prob_to_seg(prob)
+
+    if streamed:
+        return _streamed_seg_from_sources(iter_logits(), n, pm, cm, lm, props, fp16=fp16)
+
+    prob = None
+    for logits, _pm, _cm, _lm, dct in zip(iter_logits(), plans_managers, configuration_managers, label_managers, preprocessed_dicts):
+        _prob = convert_predicted_logits_to_prob_with_correct_shape(logits, _pm, _cm, _lm, dct.get('data_properties', {}))
+        del logits
+        if fp16:
+            _prob = _prob.astype(np.float16)
+        prob = _prob if prob is None else prob + _prob
+        del _prob
+    prob /= n
+    return prob_to_seg(prob)
 
 def preprocess_worker(queue1, fnames, in_dir, out_dir, suffix, output_ext, plans_managers, dataset_jsons, configuration_managers, tmp_folder, verbose=False):
     """
@@ -239,7 +347,7 @@ def limit_gpu_memory(target_gb, device_index=0):
 
 
 @torch.inference_mode()
-def inference_worker(model_cfg, predictor_class, use_mirroring, queue1, queue2, tmp_folder, verbose=False, device_id=0, gpu_limit_GB=None, fuse_logits=False):
+def inference_worker(model_cfg, predictor_class, use_mirroring, queue1, queue2, tmp_folder, verbose=False, device_id=0, gpu_limit_GB=None, fuse_logits=False, fp16=False):
     """
     Created in child process. Build predictors here (do not receive them from parent).
     Load preprocessed npz from tmp_folder, run predictors, push seg to queue2.
@@ -327,12 +435,10 @@ def inference_worker(model_cfg, predictor_class, use_mirroring, queue1, queue2, 
                 print(f"[inference_worker] Predicting {input_file} ...")
                 print(f"\tcasename: {casename}")
 
-            prob = predict_and_fuse(predictors, preprocessed_dicts, plans_managers, configuration_managers, label_managers, fuse_logits=fuse_logits, verbose=verbose)
-            if prob is None:
+            seg = predict_and_fuse(predictors, preprocessed_dicts, plans_managers, configuration_managers, label_managers, fuse_logits=fuse_logits, fp16=fp16, verbose=verbose)
+            if seg is None:
                 logger.info("[inference_worker] No predictors or no preprocessed dicts, skipping sample")
                 continue
-            seg = prob_to_seg(prob)
-            del prob
 
             queue2.put( {'seg': seg, 'casename': casename, 'input_file': input_file, 'output_file': output_file, 'out_dir': out_dir} )
             del seg
@@ -545,7 +651,7 @@ def post_process_folder(in_dir, out_dir, suffix='.nii.gz', post_process_func=Non
     logger.info(f"Post-processing done, {time.time()-st :.0f}s")
 
 @torch.inference_mode()
-def infer_one_sample(input_file, output_file, casename, predictors, post_process=True, prune_fn_name='rm_small', post_process_func=None, fuse_logits=False):
+def infer_one_sample(input_file, output_file, casename, predictors, post_process=True, prune_fn_name='rm_small', post_process_func=None, fuse_logits=False, fp16=False):
     print(f"Predicting {input_file} ...")
     print(f"\tcasename: {casename}")
 
@@ -568,15 +674,13 @@ def infer_one_sample(input_file, output_file, casename, predictors, post_process
         preprocessed_dicts.append(next(ppa))
 
     print("[*] prediction...")
-    prob = predict_and_fuse(
+    del input_array  # the preprocessed copies are what matters from here on
+    seg = predict_and_fuse(
         predictors, preprocessed_dicts,
         [p.plans_manager for p in predictors],
         [p.configuration_manager for p in predictors],
         [p.label_manager for p in predictors],
-        fuse_logits=fuse_logits)
-    print(f"[*] Ensemble fused prob shape: {prob.shape}")
-
-    seg = prob_to_seg(prob)
+        fuse_logits=fuse_logits, fp16=fp16)
     print(f"[*] Ensemble fused seg shape: {seg.shape}")
 
     if post_process:
@@ -604,7 +708,7 @@ def infer_folder(
     skip_existing=False,
     sequential=False,
     queue1_size=12, queue2_size=12, n_preprocess_workers=6, n_infer_workers=1, n_post_inference_workers=6,
-    n_gpus=1, gpu_limit_GB=None, fuse_logits=False
+    n_gpus=1, gpu_limit_GB=None, fuse_logits=False, fp16=False
 ):
     st0 = time.time()
 
@@ -653,7 +757,7 @@ def infer_folder(
             input_file = os.path.join(in_dir, fname+suffix)
             output_file = os.path.join(out_dir, fname+output_ext)
             casename = os.path.basename(input_file).replace(suffix, '')
-            infer_one_sample(input_file, output_file, casename, predictors, post_process=post_process, prune_fn_name=prune_fn_name, post_process_func=post_process_func, fuse_logits=fuse_logits)
+            infer_one_sample(input_file, output_file, casename, predictors, post_process=post_process, prune_fn_name=prune_fn_name, post_process_func=post_process_func, fuse_logits=fuse_logits, fp16=fp16)
             logger.info(f"Infer {i+1}/{len(fnames)} done, {time.time()-st :.0f}s")
     else:
         # Use multiprocessing with queues for parallel processing
@@ -704,7 +808,7 @@ def infer_folder(
         infer_processes = []
         for i in range(max(1, n_infer_workers)):
             # Distribute inference workers onto GPUs in round-robin fashion
-            p = Process(target=inference_worker, args=(model_cfg, predictor_class, use_mirroring, queue1, queue2, tmp_folder, False, i%n_gpus, gpu_limit_GB, fuse_logits))
+            p = Process(target=inference_worker, args=(model_cfg, predictor_class, use_mirroring, queue1, queue2, tmp_folder, False, i%n_gpus, gpu_limit_GB, fuse_logits, fp16))
             p.start()
             infer_processes.append(p)
 

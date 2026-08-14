@@ -11,8 +11,7 @@ fold 4, `checkpoint_final.pth`), plus an optional napari-based screenshot render
   (inference runs on GPU; CPU-only is not supported)
 - A recent NVIDIA driver (the image ships PyTorch 2.13 with bundled CUDA)
 - 16 GB of GPU VRAM recommended (the default configuration was validated with
-  GPU memory capped to 16 GB); 8 GB is enough for the slower sequential
-  fallback (validated with an 8 GB cap)
+  GPU memory capped to 16 GB; observed peak was ~7 GB in limited tested cases)
 
 ## Build
 
@@ -40,7 +39,7 @@ docker run --rm -it \
     --gpus all \
     --ipc=host \
     --user root \
-    --memory=64g --shm-size=64g \
+    --memory=32g --shm-size=32g \
     -v /path/to/your/images:/input \
     -v /path/to/your/results:/output \
     topaneu_vesselseg_uzh
@@ -53,9 +52,10 @@ already on `PATH`.
 - `--ipc=host` — recommended; the inference pipeline uses multiprocessing with shared memory
 - `--user root` — required on rootless Docker (see [File permissions & sudo](#file-permissions--sudo));
   on rootful Docker you can drop it to run as the built-in `topaneu` user
-- `--memory=64g --shm-size=64g` — validated for the default (parallel) inference
-  configuration; if you only have 32 GB to spare, use the
-  [low-memory fallback](#low-memory-fallback-sequential)
+- `--memory=32g --shm-size=32g` — validated for the default (parallel) inference
+  configuration (the ensemble export streams in slabs with a float16
+  accumulator; observed peak was ~19 GB on the largest debug cases). More memory
+  only helps when [scaling up workers](#scaling-up-advanced)
 - `-v ...:/input`, `-v ...:/output` — mount your data; any paths work, `/input` / `/output` are just conventions
 
 ## File permissions & sudo
@@ -118,17 +118,23 @@ End-to-end (non-interactive) usage:
 ```bash
 docker run --rm --gpus all --ipc=host \
     --user root \
-    --memory=64g --shm-size=64g \
+    --memory=32g --shm-size=32g \
     -v /path/to/images:/input -v /path/to/results:/output \
     topaneu_vesselseg_uzh \
-    python run_inference.py -i /input -o /output
+    python run_inference.py -i /input -o /output --gpu_limit_GB 16
 ```
 
-This configuration was validated end-to-end on 5 example cases (mixed MR/CT cases from all
-centers): ~45 s/case on a modern GPU, GPU memory capped to 16 GB during the
-test, peak container memory well inside `--memory=64g`. With only 32 GB, the
-parallel pipeline can stall on very large CT volumes (it swaps instead of
-failing) — use the [low-memory fallback](#low-memory-fallback-sequential) then.
+This configuration was validated end-to-end on 5 example cases (mixed MR/CT
+cases from all centers): ~100 s/case
+on a modern GPU under concurrent host load (timing varies with host load; ~45
+s/case was measured on an idle machine before the memory optimizations),
+GPU memory capped to 16 GB (observed VRAM peak ~7 GB), peak container memory
+19.3 GB — comfortably inside `--memory=32g`.
+
+The analysis and benchmarks behind the memory/speed defaults (slab-streamed
+ensemble export, fp16 accumulator, `--fuse_logits` fusion trade-offs) are
+documented in
+[docs/20260814_ensemble_export_optimization.md](docs/20260814_ensemble_export_optimization.md).
 
 ### Options
 
@@ -143,6 +149,8 @@ failing) — use the [low-memory fallback](#low-memory-fallback-sequential) then
 | `--n_pre_post_workers` | `1` | Preprocessing workers and post-processing workers (also the queue sizes); more is faster but holds more cases in RAM |
 | `--n_gpus` | `1` | GPUs to spread inference workers over |
 | `--gpu_limit_GB` | none | Approximate GPU memory cap in GB, applied in each inference process (works in both sequential and parallel mode) |
+| `--fp16` / `--no-fp16` | on | Keep the ensemble probability accumulator in float16 (~halves its RAM). `--no-fp16` restores the float32 accumulator; outputs differ only at near-exact probability ties, below run-to-run GPU nondeterminism |
+| `--fuse_logits` | off | Average model logits on the preprocessed grid and resample once instead of per model (~2x faster inference+export stage, lower RAM). Changes fusion from mean-of-softmax to softmax-of-mean-logits: a slightly more conservative segmentation, differing at low-confidence structure boundaries (~1.6% of foreground voxels) and dropping tiny uncertain structures (Pcom/AICA scale) slightly more often |
 | `--overwrite_existing` | off | Re-run cases whose output already exists (default: skip them) |
 | `--vis` | off | Render napari screenshot galleries of the predictions after inference |
 | `--vis_out_dir` | `<output>/viz` | Where to save screenshot PNGs (mirrors sub-folder structure) |
@@ -160,12 +168,11 @@ processing (with threads at 1, inference took ~25% longer in our tests).
 `nnUNet_n_proc_DA=1` is also set (the pipeline does not use the nnU-Net
 dataloader).
 
-### Low-memory fallback (sequential)
+### Low-VRAM fallback (sequential)
 
-If the host cannot spare 64 GB for the container, run everything in a single
-process with reduced thread counts. Validated to fit in `--memory=32g`
-(`16g`/`24g` were OOM-killed) with GPU memory capped to 8 GB — but it is much
-slower (roughly 7 min/case vs ~45 s/case for the default configuration):
+The default (parallel) pipeline fits in `--memory=32g` (see above). If your
+GPU has less than 16 GB of VRAM, run everything in a single process with
+reduced thread counts — but it is much slower:
 
 ```bash
 docker run --rm --gpus all --ipc=host \
@@ -174,11 +181,8 @@ docker run --rm --gpus all --ipc=host \
     -e OMP_NUM_THREADS=1 -e MKL_NUM_THREADS=1 -e OPENBLAS_NUM_THREADS=1 \
     -v /path/to/images:/input -v /path/to/results:/output \
     topaneu_vesselseg_uzh \
-    python run_inference.py -i /input -o /output --sequential
+    python run_inference.py -i /input -o /output --sequential --gpu_limit_GB 16
 ```
-
-Do NOT run the parallel (default) pipeline with only 32 GB: on very large CT
-volumes it exceeds the limit and stalls in swap instead of failing cleanly.
 
 ### Scaling up (advanced)
 
@@ -268,10 +272,10 @@ docker load -i topaneu_vesselseg_uzh.tar
 mkdir -p /path/to/results
 docker run --rm --gpus all --ipc=host \
     --user root \
-    --memory=64g --shm-size=64g \
+    --memory=32g --shm-size=32g \
     -v /path/to/images:/input -v /path/to/results:/output \
     topaneu_vesselseg_uzh \
-    python run_inference.py -i /input -o /output #--vis
+    python run_inference.py -i /input -o /output --gpu_limit_GB 16 #--vis
 
 ```
 

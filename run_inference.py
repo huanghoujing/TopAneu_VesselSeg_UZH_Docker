@@ -95,6 +95,12 @@ def parse_args():
                         '(~3x faster export stage). Changes fusion from mean-of-softmax '
                         'to softmax-of-mean-logits; segmentations may differ slightly '
                         'at structure boundaries.')
+    p.add_argument('--fp16', default=True, action=argparse.BooleanOptionalAction,
+                   help='Keep the ensemble probability accumulator (and with --fuse_logits '
+                        'the fused logits) in float16, roughly halving its RAM. Argmax '
+                        'output can differ from float32 only at near-exact probability '
+                        'ties, far below the run-to-run GPU nondeterminism level. '
+                        'Disable with --no-fp16.')
     p.add_argument('--overwrite_existing', action='store_true',
                    help='Re-run cases whose output file already exists (default: skip them).')
     p.add_argument('--vis', action='store_true',
@@ -188,6 +194,7 @@ def main():
         n_gpus=args.n_gpus,
         gpu_limit_GB=args.gpu_limit_GB,
         fuse_logits=args.fuse_logits,
+        fp16=args.fp16,
         use_mirroring=True,
         post_process=True,
         skip_existing=not args.overwrite_existing,
